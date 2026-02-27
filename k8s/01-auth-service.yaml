@@ -1,0 +1,95 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: auth-service
+  namespace: telemetry-search
+  labels:
+    app: auth-service
+    tier: backend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: auth-service
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: auth-service
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+      containers:
+        - name: auth-service
+          image: your-registry/telemetry-auth-service:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8081
+          env:
+            - name: PORT
+              value: "8081"
+            - name: GIN_MODE
+              value: release
+            - name: ALLOWED_ORIGIN
+              value: "https://telemetry-search.example.com"
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: telemetry-jwt-secret
+                  key: JWT_SECRET
+            - name: ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: telemetry-user-secrets
+                  key: ADMIN_PASSWORD
+            - name: WRITER_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: telemetry-user-secrets
+                  key: WRITER_PASSWORD
+            - name: READER_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: telemetry-user-secrets
+                  key: READER_PASSWORD
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "64Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8081
+            initialDelaySeconds: 5
+            periodSeconds: 15
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8081
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: auth-service
+  namespace: telemetry-search
+spec:
+  selector:
+    app: auth-service
+  ports:
+    - port: 8081
+      targetPort: 8081
+  type: ClusterIP

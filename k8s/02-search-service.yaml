@@ -1,0 +1,106 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: parquet-data-pvc
+  namespace: telemetry-search
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 50Gi
+  storageClassName: standard
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: search-service
+  namespace: telemetry-search
+  labels:
+    app: search-service
+    tier: backend
+spec:
+  replicas: 1   # Single writer pod — see architecture notes in README
+  selector:
+    matchLabels:
+      app: search-service
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0  # Zero-downtime: new pod must pass readiness before old terminates
+  template:
+    metadata:
+      labels:
+        app: search-service
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+      containers:
+        - name: search-service
+          image: your-registry/telemetry-search-service:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8082
+          env:
+            - name: PORT
+              value: "8082"
+            - name: GIN_MODE
+              value: release
+            - name: DATA_DIR
+              value: /app/parquet
+            - name: UPLOAD_DIR
+              value: /app/parquet
+            - name: ALLOWED_ORIGIN
+              value: "https://telemetry-search.example.com"
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: telemetry-jwt-secret
+                  key: JWT_SECRET
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2000m"
+              memory: "6Gi"
+          volumeMounts:
+            - name: parquet-data
+              mountPath: /app/parquet
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8082
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            failureThreshold: 3
+          # Readiness checks /ready which waits until index is loaded.
+          # The pod does NOT enter rotation until this passes.
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8082
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 60   # Allows up to 5 minutes for index load
+          securityContext:
+            allowPrivilegeEscalation: false
+      volumes:
+        - name: parquet-data
+          persistentVolumeClaim:
+            claimName: parquet-data-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: search-service
+  namespace: telemetry-search
+spec:
+  selector:
+    app: search-service
+  ports:
+    - port: 8082
+      targetPort: 8082
+  type: ClusterIP

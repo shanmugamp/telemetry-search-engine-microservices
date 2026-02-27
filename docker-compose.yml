@@ -1,0 +1,125 @@
+version: "3.9"
+
+x-common-env: &common-env
+  GIN_MODE: release
+  JWT_SECRET: ${JWT_SECRET:-telemetry-search-dev-secret-change-in-production}
+  ALLOWED_ORIGIN: ${ALLOWED_ORIGIN:-http://localhost:3000}
+
+services:
+
+  # ── API Gateway ─────────────────────────────────────────────────────────────
+  gateway:
+    build:
+      context: ./gateway
+    container_name: ts-gateway
+    ports:
+      - "3000:80"
+    depends_on:
+      auth-service:
+        condition: service_healthy
+      search-service:
+        condition: service_healthy
+      ingest-service:
+        condition: service_healthy
+      frontend:
+        condition: service_started
+    restart: unless-stopped
+    networks:
+      - telemetry-net
+
+  # ── Auth Service ─────────────────────────────────────────────────────────────
+  auth-service:
+    build:
+      context: ./auth-service
+    container_name: ts-auth
+    environment:
+      <<: *common-env
+      PORT: "8081"
+      ADMIN_PASSWORD:  ${ADMIN_PASSWORD:-admin123}
+      WRITER_PASSWORD: ${WRITER_PASSWORD:-writer123}
+      READER_PASSWORD: ${READER_PASSWORD:-reader123}
+    ports:
+      - "8081:8081"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8081/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    networks:
+      - telemetry-net
+
+  # ── Search Service ───────────────────────────────────────────────────────────
+  search-service:
+    build:
+      context: ./search-service
+    container_name: ts-search
+    environment:
+      <<: *common-env
+      PORT: "8082"
+      DATA_DIR: /app/parquet
+      UPLOAD_DIR: /app/parquet
+    volumes:
+      - parquet-data:/app/parquet
+    ports:
+      - "8082:8082"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8082/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    networks:
+      - telemetry-net
+
+  # ── Ingest Service ───────────────────────────────────────────────────────────
+  ingest-service:
+    build:
+      context: ./ingest-service
+    container_name: ts-ingest
+    environment:
+      <<: *common-env
+      PORT: "8083"
+      UPLOAD_DIR: /app/uploads
+      # Internal Docker network URL — ingest notifies search after each upload
+      SEARCH_SERVICE_URL: http://search-service:8082
+    volumes:
+      - parquet-data:/app/uploads
+    ports:
+      - "8083:8083"
+    depends_on:
+      search-service:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8083/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    networks:
+      - telemetry-net
+
+  # ── Frontend ─────────────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+    container_name: ts-frontend
+    # No VITE_API_URL needed — frontend uses relative URLs via the gateway
+    restart: unless-stopped
+    networks:
+      - telemetry-net
+
+volumes:
+  parquet-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${PARQUET_DATA_PATH:-./parquet-data}
+
+networks:
+  telemetry-net:
+    driver: bridge

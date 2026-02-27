@@ -1,0 +1,87 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ingest-service
+  namespace: telemetry-search
+  labels:
+    app: ingest-service
+    tier: backend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: ingest-service
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: ingest-service
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+      containers:
+        - name: ingest-service
+          image: your-registry/telemetry-ingest-service:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8083
+          env:
+            - name: PORT
+              value: "8083"
+            - name: GIN_MODE
+              value: release
+            - name: UPLOAD_DIR
+              value: /app/uploads
+            - name: ALLOWED_ORIGIN
+              value: "https://telemetry-search.example.com"
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: telemetry-jwt-secret
+                  key: JWT_SECRET
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"
+              memory: "2Gi"
+          volumeMounts:
+            - name: parquet-data
+              mountPath: /app/uploads
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8083
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8083
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+      volumes:
+        - name: parquet-data
+          persistentVolumeClaim:
+            claimName: parquet-data-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ingest-service
+  namespace: telemetry-search
+spec:
+  selector:
+    app: ingest-service
+  ports:
+    - port: 8083
+      targetPort: 8083
+  type: ClusterIP
