@@ -34,17 +34,13 @@ func makeToken(role string) string {
 	return s
 }
 
-func newTestHandler(t *testing.T) (*api.Handler, string) {
-	t.Helper()
-	dir := t.TempDir()
-	q := worker.New(1)
-	return api.New(q, dir), dir
-}
-
 func newTestRouter(t *testing.T) (*gin.Engine, string) {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
-	h, dir := newTestHandler(t)
+	dir := t.TempDir()
+	q := worker.New(1)
+	// Pass empty string for searchServiceURL — tests don't need real search-service notification
+	h := api.New(q, dir, "")
 	r := gin.New()
 	h.RegisterRoutes(r)
 	return r, dir
@@ -151,11 +147,9 @@ func TestUpload_NoFile(t *testing.T) {
 }
 
 func TestUpload_ValidParquet(t *testing.T) {
-	// Copy a real parquet file from the original project if available,
-	// otherwise create a minimal valid parquet-magic file and test file creation.
 	realParquet := "/home/claude/telemetry-uploaded/telemetry-search/parquet/data.parquet"
 	if _, err := os.Stat(realParquet); os.IsNotExist(err) {
-		t.Skip("real parquet file not available")
+		t.Skip("real parquet file not available in this environment")
 	}
 
 	r, dir := newTestRouter(t)
@@ -212,7 +206,6 @@ func TestGetJob_NotFound(t *testing.T) {
 
 func TestDeleteFile_WriterCanDelete(t *testing.T) {
 	r, dir := newTestRouter(t)
-	// Create a test file to delete
 	testFile := filepath.Join(dir, "test.parquet")
 	os.WriteFile(testFile, []byte("PAR1test"), 0644)
 
@@ -253,7 +246,7 @@ func TestDeleteFile_PathTraversal(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer "+makeToken("admin"))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
-	// Should be 404 (not found) or 400 (invalid), never 200
+	// Should be 400 or 404 — never 200
 	if w.Code == 200 {
 		t.Fatal("path traversal should not succeed")
 	}

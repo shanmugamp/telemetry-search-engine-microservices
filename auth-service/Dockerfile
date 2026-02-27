@@ -1,9 +1,8 @@
-FROM golang:1.24-alpine AS builder
+FROM golang:1.24 AS builder
 WORKDIR /app
 COPY go.mod ./
-RUN go mod download && go mod tidy
+RUN go mod download
 COPY . .
-RUN go mod tidy
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o auth-service ./cmd/server
 
 FROM alpine:3.19

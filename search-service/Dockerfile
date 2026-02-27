@@ -1,9 +1,9 @@
-FROM golang:1.24-alpine AS builder
+# Use full Go image (not alpine) so CGO is available for -race in tests
+FROM golang:1.24 AS builder
 WORKDIR /app
 COPY go.mod ./
-RUN go mod download && go mod tidy
+RUN go mod download
 COPY . .
-RUN go mod tidy
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o search-service ./cmd/server
 
 FROM alpine:3.19

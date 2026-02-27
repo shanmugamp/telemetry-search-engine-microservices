@@ -1,6 +1,8 @@
 package jwtutil
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"os"
 	"time"
@@ -10,9 +12,10 @@ import (
 
 // Claims is the JWT payload embedded in every token.
 type Claims struct {
-	UserID   string `json:"user_id"`
-	Username string `json:"username"`
-	Role     string `json:"role"` // admin | writer | reader
+	UserID    string `json:"user_id"`
+	Username  string `json:"username"`
+	Role      string `json:"role"`
+	TokenType string `json:"token_type"` // "access" or "refresh"
 	jwt.RegisteredClaims
 }
 
@@ -20,7 +23,7 @@ type Claims struct {
 type TokenPair struct {
 	AccessToken  string `json:"access_token"`
 	RefreshToken string `json:"refresh_token"`
-	ExpiresIn    int64  `json:"expires_in"` // seconds
+	ExpiresIn    int64  `json:"expires_in"` // seconds until access token expiry
 }
 
 const (
@@ -37,15 +40,16 @@ func jwtSecret() []byte {
 }
 
 // GeneratePair creates an access + refresh token pair for the given user.
+// Each token has a unique jti (JWT ID) to prevent token reuse collisions.
 func GeneratePair(userID, username, role string) (TokenPair, error) {
 	now := time.Now()
 
-	access, err := generateToken(userID, username, role, now.Add(AccessTokenDuration))
+	access, err := generateToken(userID, username, role, "access", now.Add(AccessTokenDuration))
 	if err != nil {
 		return TokenPair{}, err
 	}
 
-	refresh, err := generateToken(userID, username, role, now.Add(RefreshTokenDuration))
+	refresh, err := generateToken(userID, username, role, "refresh", now.Add(RefreshTokenDuration))
 	if err != nil {
 		return TokenPair{}, err
 	}
@@ -57,12 +61,18 @@ func GeneratePair(userID, username, role string) (TokenPair, error) {
 	}, nil
 }
 
-func generateToken(userID, username, role string, expiry time.Time) (string, error) {
+func generateToken(userID, username, role, tokenType string, expiry time.Time) (string, error) {
+	jti, err := randomHex(16)
+	if err != nil {
+		return "", err
+	}
 	claims := Claims{
-		UserID:   userID,
-		Username: username,
-		Role:     role,
+		UserID:    userID,
+		Username:  username,
+		Role:      role,
+		TokenType: tokenType,
 		RegisteredClaims: jwt.RegisteredClaims{
+			ID:        jti, // unique per token — prevents map key collisions in token store
 			ExpiresAt: jwt.NewNumericDate(expiry),
 			IssuedAt:  jwt.NewNumericDate(time.Now()),
 			Issuer:    "telemetry-search",
@@ -73,6 +83,7 @@ func generateToken(userID, username, role string, expiry time.Time) (string, err
 }
 
 // Parse validates a token string and returns the claims.
+// Returns an error if the token is expired, malformed, or has invalid signature.
 func Parse(tokenStr string) (*Claims, error) {
 	token, err := jwt.ParseWithClaims(tokenStr, &Claims{}, func(t *jwt.Token) (interface{}, error) {
 		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
@@ -88,4 +99,25 @@ func Parse(tokenStr string) (*Claims, error) {
 		return nil, errors.New("invalid token")
 	}
 	return claims, nil
+}
+
+// ParseRefresh is like Parse but also enforces token_type == "refresh".
+// This prevents an access token being used as a refresh token.
+func ParseRefresh(tokenStr string) (*Claims, error) {
+	claims, err := Parse(tokenStr)
+	if err != nil {
+		return nil, err
+	}
+	if claims.TokenType != "refresh" {
+		return nil, errors.New("not a refresh token")
+	}
+	return claims, nil
+}
+
+func randomHex(n int) (string, error) {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
 }

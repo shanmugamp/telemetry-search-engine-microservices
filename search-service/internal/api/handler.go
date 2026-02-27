@@ -84,7 +84,7 @@ func handleReindex(idx *indexer.Index) gin.HandlerFunc {
 		idx.SetReady(true)
 
 		slog.Info("reindex complete", "docs", count, "stats", idx.Stats())
-		c.JSON(http.StatusOK, gin.H{
+		c.JSON(http.StatusAccepted, gin.H{
 			"message": "reindex complete",
 			"stats":   idx.Stats(),
 		})

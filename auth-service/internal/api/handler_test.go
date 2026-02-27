@@ -23,21 +23,42 @@ func newTestRouter() (*gin.Engine, *store.Store) {
 	return r, s
 }
 
-func TestLogin_Success(t *testing.T) {
-	r, _ := newTestRouter()
-	body := `{"username":"admin","password":"admin123"}`
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", bytes.NewBufferString(body))
+func doJSON(r *gin.Engine, method, path, body string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, path, bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
+	return w
+}
 
+func doJSONBytes(r *gin.Engine, method, path string, body []byte) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, path, bytes.NewBuffer(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	return w
+}
+
+func loginAs(t *testing.T, r *gin.Engine, username, password string) (accessToken, refreshToken string) {
+	t.Helper()
+	w := doJSON(r, http.MethodPost, "/api/v1/auth/login",
+		`{"username":"`+username+`","password":"`+password+`"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("login failed: %d %s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	return resp["access_token"].(string), resp["refresh_token"].(string)
+}
+
+func TestLogin_Success(t *testing.T) {
+	r, _ := newTestRouter()
+	w := doJSON(r, http.MethodPost, "/api/v1/auth/login", `{"username":"admin","password":"admin123"}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200 got %d: %s", w.Code, w.Body.String())
 	}
 	var resp map[string]interface{}
-	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
-		t.Fatal(err)
-	}
+	json.Unmarshal(w.Body.Bytes(), &resp)
 	if resp["access_token"] == nil || resp["refresh_token"] == nil {
 		t.Fatal("expected tokens in response")
 	}
@@ -45,12 +66,7 @@ func TestLogin_Success(t *testing.T) {
 
 func TestLogin_InvalidPassword(t *testing.T) {
 	r, _ := newTestRouter()
-	body := `{"username":"admin","password":"wrongpassword"}`
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", bytes.NewBufferString(body))
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-	r.ServeHTTP(w, req)
-
+	w := doJSON(r, http.MethodPost, "/api/v1/auth/login", `{"username":"admin","password":"wrongpassword"}`)
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 got %d", w.Code)
 	}
@@ -58,12 +74,7 @@ func TestLogin_InvalidPassword(t *testing.T) {
 
 func TestLogin_UnknownUser(t *testing.T) {
 	r, _ := newTestRouter()
-	body := `{"username":"nobody","password":"anything"}`
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", bytes.NewBufferString(body))
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-	r.ServeHTTP(w, req)
-
+	w := doJSON(r, http.MethodPost, "/api/v1/auth/login", `{"username":"nobody","password":"anything"}`)
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 got %d", w.Code)
 	}
@@ -71,92 +82,63 @@ func TestLogin_UnknownUser(t *testing.T) {
 
 func TestLogin_MissingFields(t *testing.T) {
 	r, _ := newTestRouter()
-	body := `{"username":"admin"}`
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", bytes.NewBufferString(body))
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-	r.ServeHTTP(w, req)
-
+	w := doJSON(r, http.MethodPost, "/api/v1/auth/login", `{"username":"admin"}`)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 got %d", w.Code)
 	}
 }
 
 func TestRefresh_Success(t *testing.T) {
-	r, s := newTestRouter()
+	r, _ := newTestRouter()
+	_, refreshToken := loginAs(t, r, "admin", "admin123")
 
-	// First, login
-	body := `{"username":"admin","password":"admin123"}`
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", bytes.NewBufferString(body))
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-	r.ServeHTTP(w, req)
-
-	var loginResp map[string]interface{}
-	json.Unmarshal(w.Body.Bytes(), &loginResp)
-	refreshToken := loginResp["refresh_token"].(string)
-
-	// Now refresh
-	refreshBody, _ := json.Marshal(map[string]string{"refresh_token": refreshToken})
-	req2 := httptest.NewRequest(http.MethodPost, "/api/v1/auth/refresh", bytes.NewBuffer(refreshBody))
-	req2.Header.Set("Content-Type", "application/json")
-	w2 := httptest.NewRecorder()
-	r.ServeHTTP(w2, req2)
-
-	if w2.Code != http.StatusOK {
-		t.Fatalf("expected 200 got %d: %s", w2.Code, w2.Body.String())
+	// Use the refresh token — each call gets a fresh buffer
+	body, _ := json.Marshal(map[string]string{"refresh_token": refreshToken})
+	w := doJSONBytes(r, http.MethodPost, "/api/v1/auth/refresh", body)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d: %s", w.Code, w.Body.String())
 	}
-	var refreshResp map[string]interface{}
-	json.Unmarshal(w2.Body.Bytes(), &refreshResp)
-	if refreshResp["access_token"] == nil {
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["access_token"] == nil {
 		t.Fatal("expected new access token")
 	}
-	_ = s
 }
 
 func TestRefresh_TokenRotation(t *testing.T) {
 	r, _ := newTestRouter()
+	_, refreshToken := loginAs(t, r, "writer", "writer123")
 
-	// Login to get refresh token
-	body := `{"username":"writer","password":"writer123"}`
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", bytes.NewBufferString(body))
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-	r.ServeHTTP(w, req)
-	var loginResp map[string]interface{}
-	json.Unmarshal(w.Body.Bytes(), &loginResp)
-	refreshToken := loginResp["refresh_token"].(string)
+	body, _ := json.Marshal(map[string]string{"refresh_token": refreshToken})
 
-	// Use refresh token once — should succeed
-	rb, _ := json.Marshal(map[string]string{"refresh_token": refreshToken})
-	req2 := httptest.NewRequest(http.MethodPost, "/api/v1/auth/refresh", bytes.NewBuffer(rb))
-	req2.Header.Set("Content-Type", "application/json")
-	w2 := httptest.NewRecorder()
-	r.ServeHTTP(w2, req2)
-	if w2.Code != http.StatusOK {
-		t.Fatalf("first refresh should succeed, got %d", w2.Code)
+	// First use — must succeed
+	w1 := doJSONBytes(r, http.MethodPost, "/api/v1/auth/refresh", body)
+	if w1.Code != http.StatusOK {
+		t.Fatalf("first refresh should succeed, got %d: %s", w1.Code, w1.Body.String())
 	}
 
-	// Use the SAME refresh token again — must fail (rotation)
-	req3 := httptest.NewRequest(http.MethodPost, "/api/v1/auth/refresh", bytes.NewBuffer(rb))
-	req3.Header.Set("Content-Type", "application/json")
-	w3 := httptest.NewRecorder()
-	r.ServeHTTP(w3, req3)
-	if w3.Code != http.StatusUnauthorized {
-		t.Fatalf("second use of same refresh token should be 401, got %d", w3.Code)
+	// Second use of the SAME token — must fail (single-use rotation)
+	// IMPORTANT: create a fresh buffer; the previous one was consumed by the HTTP read
+	body2, _ := json.Marshal(map[string]string{"refresh_token": refreshToken})
+	w2 := doJSONBytes(r, http.MethodPost, "/api/v1/auth/refresh", body2)
+	if w2.Code != http.StatusUnauthorized {
+		t.Fatalf("second use of same refresh token should be 401, got %d: %s", w2.Code, w2.Body.String())
+	}
+}
+
+func TestRefresh_InvalidToken(t *testing.T) {
+	r, _ := newTestRouter()
+	w := doJSON(r, http.MethodPost, "/api/v1/auth/refresh", `{"refresh_token":"invalid.token.here"}`)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 got %d", w.Code)
 	}
 }
 
 func TestValidate_ValidToken(t *testing.T) {
 	r, _ := newTestRouter()
-	// Generate a valid token
 	pair, _ := jwtutil.GeneratePair("admin", "admin", "admin")
 	body, _ := json.Marshal(map[string]string{"token": pair.AccessToken})
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/validate", bytes.NewBuffer(body))
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-	r.ServeHTTP(w, req)
-
+	w := doJSONBytes(r, http.MethodPost, "/api/v1/auth/validate", body)
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200 got %d", w.Code)
 	}
@@ -169,25 +151,45 @@ func TestValidate_ValidToken(t *testing.T) {
 
 func TestValidate_InvalidToken(t *testing.T) {
 	r, _ := newTestRouter()
-	body := `{"token":"not.a.valid.token"}`
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/validate", bytes.NewBufferString(body))
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-	r.ServeHTTP(w, req)
-
+	w := doJSON(r, http.MethodPost, "/api/v1/auth/validate", `{"token":"not.a.valid.token"}`)
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 got %d", w.Code)
 	}
 }
 
+func TestValidate_ExpiredToken(t *testing.T) {
+	r, _ := newTestRouter()
+	// Manually crafted expired token (will fail signature or expiry check)
+	expiredToken := "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VybmFtZSI6ImFkbWluIiwiZXhwIjoxfQ.invalid"
+	body, _ := json.Marshal(map[string]string{"token": expiredToken})
+	w := doJSONBytes(r, http.MethodPost, "/api/v1/auth/validate", body)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 got %d", w.Code)
+	}
+}
+
+func TestLogout(t *testing.T) {
+	r, _ := newTestRouter()
+	_, refreshToken := loginAs(t, r, "reader", "reader123")
+
+	logoutBody, _ := json.Marshal(map[string]string{"refresh_token": refreshToken})
+	w := doJSONBytes(r, http.MethodPost, "/api/v1/auth/logout", logoutBody)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d", w.Code)
+	}
+
+	// After logout, refresh must fail
+	body, _ := json.Marshal(map[string]string{"refresh_token": refreshToken})
+	w2 := doJSONBytes(r, http.MethodPost, "/api/v1/auth/refresh", body)
+	if w2.Code != http.StatusUnauthorized {
+		t.Fatalf("refresh after logout should be 401, got %d", w2.Code)
+	}
+}
+
 func TestCreateUser_Success(t *testing.T) {
 	r, _ := newTestRouter()
-	body := `{"username":"newuser","password":"securepass123","role":"reader"}`
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/users", bytes.NewBufferString(body))
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-	r.ServeHTTP(w, req)
-
+	w := doJSON(r, http.MethodPost, "/api/v1/admin/users",
+		`{"username":"newuser","password":"securepass123","role":"reader"}`)
 	if w.Code != http.StatusCreated {
 		t.Fatalf("expected 201 got %d: %s", w.Code, w.Body.String())
 	}
@@ -195,12 +197,8 @@ func TestCreateUser_Success(t *testing.T) {
 
 func TestCreateUser_Duplicate(t *testing.T) {
 	r, _ := newTestRouter()
-	body := `{"username":"admin","password":"securepass123","role":"reader"}`
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/users", bytes.NewBufferString(body))
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-	r.ServeHTTP(w, req)
-
+	w := doJSON(r, http.MethodPost, "/api/v1/admin/users",
+		`{"username":"admin","password":"securepass123","role":"reader"}`)
 	if w.Code != http.StatusConflict {
 		t.Fatalf("expected 409 got %d", w.Code)
 	}
@@ -213,27 +211,5 @@ func TestHealth(t *testing.T) {
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200 got %d", w.Code)
-	}
-}
-
-func TestLogout(t *testing.T) {
-	r, _ := newTestRouter()
-	// Login first
-	body := `{"username":"reader","password":"reader123"}`
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", bytes.NewBufferString(body))
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-	r.ServeHTTP(w, req)
-	var loginResp map[string]interface{}
-	json.Unmarshal(w.Body.Bytes(), &loginResp)
-
-	// Logout
-	logoutBody, _ := json.Marshal(map[string]string{"refresh_token": loginResp["refresh_token"].(string)})
-	req2 := httptest.NewRequest(http.MethodPost, "/api/v1/auth/logout", bytes.NewBuffer(logoutBody))
-	req2.Header.Set("Content-Type", "application/json")
-	w2 := httptest.NewRecorder()
-	r.ServeHTTP(w2, req2)
-	if w2.Code != http.StatusOK {
-		t.Fatalf("expected 200 got %d", w2.Code)
 	}
 }

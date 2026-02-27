@@ -1,14 +1,12 @@
-FROM golang:1.24-alpine AS builder
+FROM golang:1.24 AS builder
 WORKDIR /app
 COPY go.mod ./
-RUN go mod download && go mod tidy
+RUN go mod download
 COPY . .
-RUN go mod tidy
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o ingest-service ./cmd/server
 
 FROM alpine:3.19
-RUN addgroup -S appgroup && adduser -S appuser -G appgroup && \
-    mkdir -p /app/uploads && chown appuser:appgroup /app/uploads
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup
 COPY --from=builder /app/ingest-service /ingest-service
 RUN chown appuser:appgroup /ingest-service
 USER appuser
