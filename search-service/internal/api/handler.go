@@ -19,18 +19,12 @@ func RegisterRoutes(r *gin.Engine, idx *indexer.Index) {
 	r.GET("/health", handleHealth())
 	r.GET("/ready", handleReady(idx))
 
-	// All API routes require authentication.
 	api := r.Group("/api/v1")
 	api.Use(middleware.RequireAuth())
 	{
-		// reader role: can search and view stats
 		api.GET("/search", handleSearch(idx))
 		api.GET("/stats", handleStats(idx))
-
-		// writer role: can trigger reindex or notify of new files
 		api.POST("/reindex", middleware.RequireRole("writer"), handleReindex(idx))
-
-		// Called by ingest-service after a successful upload to index the new file
 		api.POST("/ingest-notify", middleware.RequireRole("writer"), handleIngestNotify(idx))
 	}
 }
@@ -51,13 +45,59 @@ func handleReady(idx *indexer.Index) gin.HandlerFunc {
 	}
 }
 
+// handleSearch parses both the full-text ?q= parameter and the nine
+// per-field filter parameters, builds a SearchQuery, and returns results.
+//
+// Query parameters:
+//
+//	q               – full-text BM25 query (searched across all fields)
+//	sender          – filter by Sender field (case-insensitive substring)
+//	hostname        – filter by Hostname
+//	app_name        – filter by AppName
+//	proc_id         – filter by ProcId
+//	msg_id          – filter by MsgId
+//	groupings       – filter by Groupings
+//	facility        – filter by FacilityString
+//	raw_message     – filter by MessageRaw
+//	structured_data – filter by StructuredData
+//	page            – page number (default 1)
+//	page_size       – results per page (default 20, max 100)
 func handleSearch(idx *indexer.Index) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		query := c.Query("q")
 		page, pageSize := parsePagination(c)
 		username, _ := c.Get("username")
-		slog.Info("search request", "query", query, "page", page, "user", username)
-		result := idx.Search(query, page, pageSize)
+
+		q := indexer.SearchQuery{
+			Query:          c.Query("q"),
+			Sender:         c.Query("sender"),
+			Hostname:       c.Query("hostname"),
+			AppName:        c.Query("app_name"),
+			ProcID:         c.Query("proc_id"),
+			MsgID:          c.Query("msg_id"),
+			Groupings:      c.Query("groupings"),
+			Facility:       c.Query("facility"),
+			RawMessage:     c.Query("raw_message"),
+			StructuredData: c.Query("structured_data"),
+			Page:           page,
+			PageSize:       pageSize,
+		}
+
+		slog.Info("search request",
+			"query", q.Query,
+			"sender", q.Sender,
+			"hostname", q.Hostname,
+			"app_name", q.AppName,
+			"proc_id", q.ProcID,
+			"msg_id", q.MsgID,
+			"groupings", q.Groupings,
+			"facility", q.Facility,
+			"raw_message", q.RawMessage,
+			"structured_data", q.StructuredData,
+			"page", page,
+			"user", username,
+		)
+
+		result := idx.Search(q)
 		c.JSON(http.StatusOK, result)
 	}
 }
@@ -92,7 +132,6 @@ func handleReindex(idx *indexer.Index) gin.HandlerFunc {
 }
 
 // handleIngestNotify indexes a single newly uploaded file without a full reset.
-// Called by ingest-service after a successful file save.
 func handleIngestNotify(idx *indexer.Index) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var req struct {

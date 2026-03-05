@@ -42,7 +42,7 @@ func ReadParquet(path string) ([]model.Document, error) {
 		pathMap[strings.ToLower(leafName)] = pathKey
 	}
 
-	slog.Debug("parquet discovered columns", "count", len(pathMap))
+	slog.Info("parquet discovered columns", "count", len(pathMap), "columns", getColumnNames(pathMap))
 
 	colData := make(map[string][]string, len(pathMap))
 	for lcName, fullPath := range pathMap {
@@ -78,7 +78,7 @@ func ReadParquet(path string) ([]model.Document, error) {
 			MsgId:          get(colData, i, "msgid", "msg_id"),
 			PartitionId:    get(colData, i, "partitionid", "partition_id"),
 			Timestamp:      get(colData, i, "timestamp"),
-			Hostname:       get(colData, i, "hostname"),
+			Hostname:       get(colData, i, "hostname", "host_name", "host"),
 			FacilityString: get(colData, i, "facilitystring", "facility_string"),
 			SeverityString: get(colData, i, "severitystring", "severity_string"),
 			AppName:        get(colData, i, "appname", "app_name"),
@@ -109,6 +109,14 @@ func get(data map[string][]string, i int, names ...string) string {
 		}
 	}
 	return ""
+}
+
+func getColumnNames(pathMap map[string]string) []string {
+	names := make([]string, 0, len(pathMap))
+	for name := range pathMap {
+		names = append(names, name)
+	}
+	return names
 }
 
 func parseInt64(s string) int64 {

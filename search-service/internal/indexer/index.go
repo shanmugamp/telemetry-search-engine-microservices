@@ -29,6 +29,28 @@ type IndexStats struct {
 	IndexReady     bool     `json:"index_ready"`
 }
 
+// SearchQuery holds the full-text query plus optional per-field filters.
+// All non-empty field filters are ANDed: a document must satisfy every
+// supplied filter to appear in results.
+type SearchQuery struct {
+	// Full-text query searched across all indexed fields.
+	Query string
+
+	// Per-field exact/substring filters (case-insensitive).
+	Sender         string
+	Hostname       string
+	AppName        string
+	ProcID         string
+	MsgID          string
+	Groupings      string
+	Facility       string // matches FacilityString
+	RawMessage     string // matches MessageRaw
+	StructuredData string
+
+	Page     int
+	PageSize int
+}
+
 // posting stores term frequency for a single document.
 type posting struct {
 	freq int
@@ -49,9 +71,8 @@ type Index struct {
 	totalLength int64
 	nextID      int64
 	files       []string
-	ready       bool // true after initial load completes
+	ready       bool
 
-	// Simple LRU-style cache: map[cacheKey]cacheEntry
 	cacheMu sync.RWMutex
 	cache   map[string]cacheEntry
 }
@@ -74,14 +95,54 @@ func NewIndex() *Index {
 	}
 }
 
-// searchableText concatenates all indexed fields.
+// searchableText concatenates all fields that contribute to full-text BM25 scoring.
+// Covers every field requested: Sender, Hostname, AppName, ProcID, MsgID,
+// Groupings, FacilityString, MessageRaw, StructuredData, plus Message,
+// Tag, Event, Namespace, SeverityString.
 func searchableText(doc model.Document) string {
 	return strings.Join([]string{
-		doc.Message, doc.MessageRaw, doc.StructuredData,
-		doc.Tag, doc.Sender, doc.Event, doc.Namespace,
-		doc.AppName, doc.Hostname, doc.SeverityString,
-		doc.FacilityString, doc.ProcId, doc.MsgId,
+		doc.Message,
+		doc.MessageRaw,
+		doc.StructuredData,
+		doc.Tag,
+		doc.Sender,
+		doc.Hostname,
+		doc.AppName,
+		doc.ProcId,
+		doc.MsgId,
+		doc.Groupings,
+		doc.FacilityString,
+		doc.SeverityString,
+		doc.Event,
+		doc.Namespace,
 	}, " ")
+}
+
+// fieldFiltersMatch returns true when doc satisfies every non-empty field filter
+// in q. Matching is case-insensitive substring so partial values work.
+func fieldFiltersMatch(doc model.Document, q SearchQuery) bool {
+	check := func(field, filter string) bool {
+		if filter == "" {
+			return true
+		}
+		return strings.Contains(strings.ToLower(field), strings.ToLower(filter))
+	}
+	return check(doc.Sender, q.Sender) &&
+		check(doc.Hostname, q.Hostname) &&
+		check(doc.AppName, q.AppName) &&
+		check(doc.ProcId, q.ProcID) &&
+		check(doc.MsgId, q.MsgID) &&
+		check(doc.Groupings, q.Groupings) &&
+		check(doc.FacilityString, q.Facility) &&
+		check(doc.MessageRaw, q.RawMessage) &&
+		check(doc.StructuredData, q.StructuredData)
+}
+
+// hasFieldFilters returns true when at least one per-field filter is set.
+func hasFieldFilters(q SearchQuery) bool {
+	return q.Sender != "" || q.Hostname != "" || q.AppName != "" ||
+		q.ProcID != "" || q.MsgID != "" || q.Groupings != "" ||
+		q.Facility != "" || q.RawMessage != "" || q.StructuredData != ""
 }
 
 // AddDocument assigns an ID and indexes doc.
@@ -139,7 +200,6 @@ func (idx *Index) Reset() {
 	idx.nextID = 0
 	idx.files = nil
 	idx.ready = false
-	// Clear cache on reset
 	idx.cacheMu.Lock()
 	idx.cache = make(map[string]cacheEntry)
 	idx.cacheMu.Unlock()
@@ -150,16 +210,25 @@ type scoredDoc struct {
 	score float64
 }
 
-// Search runs a BM25 query with pagination and LRU caching.
-func (idx *Index) Search(query string, page, pageSize int) SearchResult {
-	// Clamp query length to prevent DoS.
-	if len(query) > maxQueryLen {
-		query = query[:maxQueryLen]
+// Search runs a BM25 query with optional per-field filters and pagination.
+//
+// Execution strategy:
+//
+//  1. If a full-text Query is present, score all matching documents via BM25,
+//     then post-filter by any field filters supplied.
+//
+//  2. If only field filters are present (no full-text query), scan all documents
+//     and return those that satisfy the filters, ordered by document insertion
+//     order (descending – newest first).
+//
+//  3. If neither is present, return empty results.
+func (idx *Index) Search(q SearchQuery) SearchResult {
+	if len(q.Query) > maxQueryLen {
+		q.Query = q.Query[:maxQueryLen]
 	}
 
-	cacheKey := cacheKeyFor(query, page, pageSize)
+	cacheKey := buildCacheKey(q)
 
-	// Check cache.
 	idx.cacheMu.RLock()
 	if entry, ok := idx.cache[cacheKey]; ok && time.Now().Before(entry.expiresAt) {
 		result := entry.result
@@ -173,45 +242,69 @@ func (idx *Index) Search(query string, page, pageSize int) SearchResult {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 
-	tokens := Tokenize(query)
-	if len(tokens) == 0 {
-		return SearchResult{Page: page, PageSize: pageSize}
+	tokens := Tokenize(q.Query)
+	noFullText := len(tokens) == 0
+	noFilters := !hasFieldFilters(q)
+
+	if noFullText && noFilters {
+		return SearchResult{Page: q.Page, PageSize: q.PageSize}
 	}
 
-	N := float64(len(idx.docs))
-	avgLen := 1.0
-	if N > 0 {
-		avgLen = float64(idx.totalLength) / N
-	}
+	var ranked []scoredDoc
 
-	scores := make(map[int64]float64, 256)
-	for _, token := range tokens {
-		postings, ok := idx.inverted[token]
-		if !ok {
-			continue
+	if noFullText {
+		// Field-filter-only path: scan all docs in reverse insertion order.
+		ranked = make([]scoredDoc, 0, 64)
+		for id, doc := range idx.docs {
+			if fieldFiltersMatch(doc, q) {
+				// Use negative ID so higher (newer) IDs sort first.
+				ranked = append(ranked, scoredDoc{id: id, score: float64(-id)})
+			}
 		}
-		df := float64(len(postings))
-		idf := math.Log((N-df+0.5)/(df+0.5) + 1)
-
-		for docID, p := range postings {
-			dl := float64(idx.docLengths[docID])
-			tf := float64(p.freq)
-			norm := tf * (bm25K1 + 1) / (tf + bm25K1*(1-bm25B+bm25B*dl/avgLen))
-			scores[docID] += idf * norm
+		slices.SortFunc(ranked, func(a, b scoredDoc) int {
+			return cmp.Compare(a.score, b.score) // ascending score = descending id
+		})
+	} else {
+		// BM25 path.
+		N := float64(len(idx.docs))
+		avgLen := 1.0
+		if N > 0 {
+			avgLen = float64(idx.totalLength) / N
 		}
-	}
 
-	ranked := make([]scoredDoc, 0, len(scores))
-	for id, s := range scores {
-		ranked = append(ranked, scoredDoc{id, s})
+		scores := make(map[int64]float64, 256)
+		for _, token := range tokens {
+			postings, ok := idx.inverted[token]
+			if !ok {
+				continue
+			}
+			df := float64(len(postings))
+			idf := math.Log((N-df+0.5)/(df+0.5) + 1)
+
+			for docID, p := range postings {
+				dl := float64(idx.docLengths[docID])
+				tf := float64(p.freq)
+				norm := tf * (bm25K1 + 1) / (tf + bm25K1*(1-bm25B+bm25B*dl/avgLen))
+				scores[docID] += idf * norm
+			}
+		}
+
+		// Post-filter by field filters if any are set.
+		ranked = make([]scoredDoc, 0, len(scores))
+		for id, s := range scores {
+			doc := idx.docs[id]
+			if fieldFiltersMatch(doc, q) {
+				ranked = append(ranked, scoredDoc{id, s})
+			}
+		}
+		slices.SortFunc(ranked, func(a, b scoredDoc) int {
+			return cmp.Compare(b.score, a.score)
+		})
 	}
-	slices.SortFunc(ranked, func(a, b scoredDoc) int {
-		return cmp.Compare(b.score, a.score)
-	})
 
 	total := len(ranked)
-	lo := min((page-1)*pageSize, total)
-	hi := min(lo+pageSize, total)
+	lo := min((q.Page-1)*q.PageSize, total)
+	hi := min(lo+q.PageSize, total)
 
 	pageResults := ranked[lo:hi]
 	docs := make([]model.Document, len(pageResults))
@@ -222,16 +315,14 @@ func (idx *Index) Search(query string, page, pageSize int) SearchResult {
 	result := SearchResult{
 		Documents:  docs,
 		TotalCount: total,
-		Page:       page,
-		PageSize:   pageSize,
+		Page:       q.Page,
+		PageSize:   q.PageSize,
 		TookMs:     float64(time.Since(start).Microseconds()) / 1000.0,
 		CacheHit:   false,
 	}
 
-	// Store in cache (evict if at capacity).
 	idx.cacheMu.Lock()
 	if len(idx.cache) >= cacheMaxSize {
-		// Evict one random entry.
 		for k := range idx.cache {
 			delete(idx.cache, k)
 			break
@@ -262,8 +353,14 @@ func (idx *Index) InvalidateCache() {
 	idx.cache = make(map[string]cacheEntry)
 }
 
-func cacheKeyFor(query string, page, pageSize int) string {
-	return strings.Join([]string{query, itoa(page), itoa(pageSize)}, "|")
+func buildCacheKey(q SearchQuery) string {
+	parts := []string{
+		q.Query, q.Sender, q.Hostname, q.AppName,
+		q.ProcID, q.MsgID, q.Groupings, q.Facility,
+		q.RawMessage, q.StructuredData,
+		itoa(q.Page), itoa(q.PageSize),
+	}
+	return strings.Join(parts, "|")
 }
 
 func itoa(n int) string {

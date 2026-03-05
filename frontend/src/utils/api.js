@@ -60,13 +60,29 @@ api.interceptors.response.use(
 
 // ── Auth ──────────────────────────────────────────────────────────────────────
 export const login  = (username, password) =>
-  api.post("/api/v1/auth/login",   { username, password });
+  api.post("/api/v1/auth/login",  { username, password });
 export const logout = (refreshToken) =>
-  api.post("/api/v1/auth/logout",  { refresh_token: refreshToken });
+  api.post("/api/v1/auth/logout", { refresh_token: refreshToken });
 
 // ── Search service ────────────────────────────────────────────────────────────
-export const search   = (query, page = 1, pageSize = 20) =>
-  api.get("/api/v1/search", { params: { q: query, page, page_size: pageSize } });
+// `filters` is an object with any combination of:
+//   q, sender, hostname, app_name, proc_id, msg_id,
+//   groupings, facility, raw_message, structured_data
+// Only non-empty values are forwarded to the backend.
+export const search = (filters = {}, page = 1, pageSize = 20) => {
+  const FIELD_KEYS = [
+    "q", "sender", "hostname", "app_name", "proc_id",
+    "msg_id", "groupings", "facility", "raw_message", "structured_data",
+  ];
+  const params = { page, page_size: pageSize };
+  for (const key of FIELD_KEYS) {
+    const val = filters[key];
+    if (val !== undefined && val !== null && String(val).trim() !== "") {
+      params[key] = String(val).trim();
+    }
+  }
+  return api.get("/api/v1/search", { params });
+};
 
 export const getStats = () => api.get("/api/v1/stats");
 
@@ -82,9 +98,9 @@ export const uploadFile = (file, onProgress) => {
   });
 };
 
-export const getFiles  = ()    => api.get("/api/v1/files");
+export const getFiles   = ()     => api.get("/api/v1/files");
 export const deleteFile = (name) => api.delete(`/api/v1/files/${encodeURIComponent(name)}`);
-export const getJob    = (id)  => api.get(`/api/v1/jobs/${id}`);
-export const getJobs   = ()    => api.get("/api/v1/jobs");
+export const getJob     = (id)   => api.get(`/api/v1/jobs/${id}`);
+export const getJobs    = ()     => api.get("/api/v1/jobs");
 
 export default api;
