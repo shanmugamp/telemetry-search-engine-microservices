@@ -1,13 +1,28 @@
-version: "3.9"
-
 x-common-env: &common-env
   GIN_MODE: release
   JWT_SECRET: ${JWT_SECRET:-telemetry-search-dev-secret-change-in-production}
   ALLOWED_ORIGIN: ${ALLOWED_ORIGIN:-http://localhost:3000}
 
+# ── Shared search-shard template ──────────────────────────────────────────────
+x-shard: &shard-base
+  build:
+    context: ./search-service
+  environment:
+    <<: *common-env
+    PORT: "8082"
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD", "wget", "-qO-", "http://localhost:8082/health"]
+    interval: 15s
+    timeout: 5s
+    retries: 3
+    start_period: 30s
+  networks:
+    - telemetry-net
+
 services:
 
-  # ── API Gateway ─────────────────────────────────────────────────────────────
+  # ── API Gateway ──────────────────────────────────────────────────────────────
   gateway:
     build:
       context: ./gateway
@@ -17,7 +32,7 @@ services:
     depends_on:
       auth-service:
         condition: service_healthy
-      search-service:
+      coordinator:
         condition: service_healthy
       ingest-service:
         condition: service_healthy
@@ -50,51 +65,99 @@ services:
     networks:
       - telemetry-net
 
-  # ── Search Service ───────────────────────────────────────────────────────────
-  search-service:
-    build:
-      context: ./search-service
-    container_name: ts-search
+  # ── Search Shard 0 — parquet files 0,3,6,9,… ─────────────────────────────────
+  shard-0:
+    <<: *shard-base
+    container_name: ts-shard-0
     environment:
       <<: *common-env
       PORT: "8082"
       DATA_DIR: /app/parquet
-      UPLOAD_DIR: /app/parquet
+      SHARD_ID: "0"
     volumes:
-      - parquet-data:/app/parquet
+      - shard-0-data:/app/parquet
     ports:
       - "8082:8082"
+
+  # ── Search Shard 1 — parquet files 1,4,7,10,… ────────────────────────────────
+  shard-1:
+    <<: *shard-base
+    container_name: ts-shard-1
+    environment:
+      <<: *common-env
+      PORT: "8082"
+      DATA_DIR: /app/parquet
+      SHARD_ID: "1"
+    volumes:
+      - shard-1-data:/app/parquet
+    ports:
+      - "8083:8082"
+
+  # ── Search Shard 2 — parquet files 2,5,8,11,… ────────────────────────────────
+  shard-2:
+    <<: *shard-base
+    container_name: ts-shard-2
+    environment:
+      <<: *common-env
+      PORT: "8082"
+      DATA_DIR: /app/parquet
+      SHARD_ID: "2"
+    volumes:
+      - shard-2-data:/app/parquet
+    ports:
+      - "8084:8082"
+
+  # ── Query Coordinator ────────────────────────────────────────────────────────
+  # Fans queries to all 3 shards in parallel, merges and ranks globally.
+  coordinator:
+    build:
+      context: ./coordinator
+    container_name: ts-coordinator
+    environment:
+      <<: *common-env
+      PORT: "8090"
+      SHARD_URLS: "http://shard-0:8082,http://shard-1:8082,http://shard-2:8082"
+    ports:
+      - "8090:8090"
+    depends_on:
+      shard-0:
+        condition: service_healthy
+      shard-1:
+        condition: service_healthy
+      shard-2:
+        condition: service_healthy
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8082/health"]
+      test: ["CMD", "wget", "-qO-", "http://localhost:8090/health"]
       interval: 15s
       timeout: 5s
       retries: 3
-      start_period: 20s
+      start_period: 10s
     networks:
       - telemetry-net
 
   # ── Ingest Service ───────────────────────────────────────────────────────────
+  # Routes uploads to the correct shard via coordinator.
   ingest-service:
     build:
       context: ./ingest-service
     container_name: ts-ingest
     environment:
       <<: *common-env
-      PORT: "8083"
+      PORT: "8085"
       UPLOAD_DIR: /app/uploads
-      # Internal Docker network URL — ingest notifies search after each upload
-      SEARCH_SERVICE_URL: http://search-service:8082
+      SEARCH_SERVICE_URL: http://coordinator:8090
     volumes:
-      - parquet-data:/app/uploads
+      # Ingest writes to a staging volume; coordinator routes to correct shard.
+      - ingest-staging:/app/uploads
     ports:
-      - "8083:8083"
+      - "8086:8085"
     depends_on:
-      search-service:
+      coordinator:
         condition: service_healthy
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8083/health"]
+      test: ["CMD", "wget", "-qO-", "http://localhost:8085/health"]
       interval: 15s
       timeout: 5s
       retries: 3
@@ -107,18 +170,35 @@ services:
     build:
       context: ./frontend
     container_name: ts-frontend
-    # No VITE_API_URL needed — frontend uses relative URLs via the gateway
     restart: unless-stopped
     networks:
       - telemetry-net
 
 volumes:
-  parquet-data:
+  shard-0-data:
     driver: local
     driver_opts:
       type: none
       o: bind
-      device: ${PARQUET_DATA_PATH:-./parquet-data}
+      device: ${SHARD_0_DATA:-./parquet-data/shard-0}
+  shard-1-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${SHARD_1_DATA:-./parquet-data/shard-1}
+  shard-2-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${SHARD_2_DATA:-./parquet-data/shard-2}
+  ingest-staging:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${INGEST_STAGING:-./parquet-data/staging}
 
 networks:
   telemetry-net:

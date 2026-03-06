@@ -592,45 +592,6 @@ func TestSearch_FluentBit_FieldFilter_Hostname(t *testing.T) {
 	}
 }
 
-func TestSearch_FluentBit_FieldFilter_Partial(t *testing.T) {
-	// Substring matching in field filter: "fluent" should match "fluent-bit"
-	idx := indexer.NewIndex()
-	addDoc(idx, model.Document{Message: "log", Hostname: "fluent-bit"})
-	addDoc(idx, model.Document{Message: "log", Hostname: "fluent-agent"})
-	addDoc(idx, model.Document{Message: "log", Hostname: "nginx"})
-	idx.SetReady(true)
-
-	r := search(idx, indexer.SearchQuery{Hostname: "fluent", Page: 1, PageSize: 20})
-	if r.TotalCount != 2 {
-		t.Errorf("partial hostname filter 'fluent': expected 2, got %d", r.TotalCount)
-	}
-}
-
-func TestSearch_FluentBit_Combined_QueryAndHostname(t *testing.T) {
-	// Full-text query + hostname field filter together
-	idx := indexer.NewIndex()
-	addDoc(idx, model.Document{
-		Message:  "error connection refused",
-		Hostname: "fluent-bit",
-	})
-	addDoc(idx, model.Document{
-		Message:  "error connection refused",
-		Hostname: "nginx-proxy",
-	})
-	addDoc(idx, model.Document{
-		Message:  "started successfully",
-		Hostname: "fluent-bit",
-	})
-	idx.SetReady(true)
-
-	r := search(idx, indexer.SearchQuery{
-		Query: "error", Hostname: "fluent-bit", Page: 1, PageSize: 20,
-	})
-	if r.TotalCount != 1 {
-		t.Errorf("q=error&hostname=fluent-bit: expected 1, got %d", r.TotalCount)
-	}
-}
-
 func TestSearch_HyphenatedHostnames_General(t *testing.T) {
 	// Ensure any hyphenated hostname is searchable
 	idx := indexer.NewIndex()
@@ -719,6 +680,20 @@ func TestSearch_FluentBit_FieldFilter_Exact(t *testing.T) {
 	}
 }
 
+func TestSearch_FluentBit_FieldFilter_Partial(t *testing.T) {
+	// Substring match in field filter: "fluent" matches "fluent-bit" and "fluent-agent"
+	idx := indexer.NewIndex()
+	addDoc(idx, model.Document{Message: "log", Hostname: "fluent-bit"})
+	addDoc(idx, model.Document{Message: "log", Hostname: "fluent-agent"})
+	addDoc(idx, model.Document{Message: "log", Hostname: "nginx"})
+	idx.SetReady(true)
+
+	r := search(idx, indexer.SearchQuery{Hostname: "fluent", Page: 1, PageSize: 20})
+	if r.TotalCount != 2 {
+		t.Errorf("hostname=fluent (partial) expected 2, got %d", r.TotalCount)
+	}
+}
+
 func TestSearch_FluentBit_FieldFilter_CaseInsensitive(t *testing.T) {
 	idx := indexer.NewIndex()
 	addDoc(idx, model.Document{Message: "log", Hostname: "Fluent-Bit"})
@@ -727,6 +702,20 @@ func TestSearch_FluentBit_FieldFilter_CaseInsensitive(t *testing.T) {
 	r := search(idx, indexer.SearchQuery{Hostname: "fluent-bit", Page: 1, PageSize: 20})
 	if r.TotalCount != 1 {
 		t.Errorf("case-insensitive hostname filter: expected 1, got %d", r.TotalCount)
+	}
+}
+
+func TestSearch_FluentBit_Combined_QueryAndHostname(t *testing.T) {
+	idx := indexer.NewIndex()
+	addDoc(idx, model.Document{Message: "error connection refused", Hostname: "fluent-bit"})
+	addDoc(idx, model.Document{Message: "error connection refused", Hostname: "nginx-proxy"})
+	addDoc(idx, model.Document{Message: "started successfully", Hostname: "fluent-bit"})
+	idx.SetReady(true)
+
+	// Full-text "error" + hostname filter "fluent-bit" → only 1 doc matches both
+	r := search(idx, indexer.SearchQuery{Query: "error", Hostname: "fluent-bit", Page: 1, PageSize: 20})
+	if r.TotalCount != 1 {
+		t.Errorf("q=error&hostname=fluent-bit: expected 1, got %d", r.TotalCount)
 	}
 }
 

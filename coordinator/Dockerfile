@@ -1,0 +1,13 @@
+FROM golang:1.24-alpine AS builder
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -o coordinator ./cmd/server
+
+FROM alpine:3.19
+RUN apk add --no-cache wget ca-certificates
+WORKDIR /app
+COPY --from=builder /app/coordinator .
+EXPOSE 8090
+CMD ["./coordinator"]

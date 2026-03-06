@@ -15,23 +15,24 @@ import (
 )
 
 func main() {
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	slog.SetDefault(logger)
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})))
 
 	idx := indexer.NewIndex()
 
-	// Scan DATA_DIR and UPLOAD_DIR at startup.
-	dirs := uniqueDirs(os.Getenv("DATA_DIR"), os.Getenv("UPLOAD_DIR"))
-	if len(dirs) == 0 {
-		slog.Warn("no DATA_DIR or UPLOAD_DIR set")
-	}
-	for _, dir := range dirs {
+	// Bulk-load all parquet files. AddDocument appends unsorted posting entries.
+	for _, dir := range uniqueDirs(os.Getenv("DATA_DIR"), os.Getenv("UPLOAD_DIR")) {
 		loadDir(idx, dir)
 	}
 
-	// Mark index ready AFTER loading — readiness probe won't pass until here.
+	// Finalize: sort all posting lists by docID, build blocks, compute WAND upper-bounds.
+	// Must happen before the first Search call.
+	idx.Finalize()
 	idx.SetReady(true)
-	slog.Info("index ready", "documents", idx.Stats().TotalDocuments, "terms", idx.Stats().TotalTerms)
+
+	slog.Info("index ready (WAND)",
+		"documents", idx.Stats().TotalDocuments,
+		"terms", idx.Stats().TotalTerms,
+	)
 
 	gin.SetMode(envOr("GIN_MODE", "release"))
 	r := gin.New()
@@ -71,7 +72,7 @@ func loadDir(idx *indexer.Index, dir string) {
 			idx.AddDocument(docs[i])
 		}
 		idx.AddFile(filepath.Base(f))
-		slog.Info("indexed at startup", "file", filepath.Base(f), "docs", len(docs))
+		slog.Info("loaded file", "file", filepath.Base(f), "docs", len(docs))
 	}
 }
 

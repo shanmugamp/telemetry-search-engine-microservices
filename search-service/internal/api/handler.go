@@ -14,7 +14,6 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// RegisterRoutes wires all search endpoints with JWT protection.
 func RegisterRoutes(r *gin.Engine, idx *indexer.Index) {
 	r.GET("/health", handleHealth())
 	r.GET("/ready", handleReady(idx))
@@ -45,23 +44,6 @@ func handleReady(idx *indexer.Index) gin.HandlerFunc {
 	}
 }
 
-// handleSearch parses both the full-text ?q= parameter and the nine
-// per-field filter parameters, builds a SearchQuery, and returns results.
-//
-// Query parameters:
-//
-//	q               – full-text BM25 query (searched across all fields)
-//	sender          – filter by Sender field (case-insensitive substring)
-//	hostname        – filter by Hostname
-//	app_name        – filter by AppName
-//	proc_id         – filter by ProcId
-//	msg_id          – filter by MsgId
-//	groupings       – filter by Groupings
-//	facility        – filter by FacilityString
-//	raw_message     – filter by MessageRaw
-//	structured_data – filter by StructuredData
-//	page            – page number (default 1)
-//	page_size       – results per page (default 20, max 100)
 func handleSearch(idx *indexer.Index) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		page, pageSize := parsePagination(c)
@@ -78,24 +60,13 @@ func handleSearch(idx *indexer.Index) gin.HandlerFunc {
 			Facility:       c.Query("facility"),
 			RawMessage:     c.Query("raw_message"),
 			StructuredData: c.Query("structured_data"),
+			Severity:       c.Query("severity"), // NEW field
 			Page:           page,
 			PageSize:       pageSize,
 		}
 
-		slog.Info("search request",
-			"query", q.Query,
-			"sender", q.Sender,
-			"hostname", q.Hostname,
-			"app_name", q.AppName,
-			"proc_id", q.ProcID,
-			"msg_id", q.MsgID,
-			"groupings", q.Groupings,
-			"facility", q.Facility,
-			"raw_message", q.RawMessage,
-			"structured_data", q.StructuredData,
-			"page", page,
-			"user", username,
-		)
+		slog.Info("search", "q", q.Query, "hostname", q.Hostname,
+			"severity", q.Severity, "page", page, "user", username)
 
 		result := idx.Search(q)
 		c.JSON(http.StatusOK, result)
@@ -103,35 +74,26 @@ func handleSearch(idx *indexer.Index) gin.HandlerFunc {
 }
 
 func handleStats(idx *indexer.Index) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		c.JSON(http.StatusOK, idx.Stats())
-	}
+	return func(c *gin.Context) { c.JSON(http.StatusOK, idx.Stats()) }
 }
 
-// handleReindex does a full reset + reload of all parquet files from DATA_DIR.
 func handleReindex(idx *indexer.Index) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		username, _ := c.Get("username")
 		slog.Info("full reindex triggered", "user", username)
 
-		dataDir := os.Getenv("DATA_DIR")
-		if dataDir == "" {
-			dataDir = os.Getenv("UPLOAD_DIR")
-		}
-
+		dataDir := dataDir()
 		idx.Reset()
 		count := loadDir(idx, dataDir)
+		// Finalize sorts all posting lists and computes WAND upper-bounds.
+		idx.Finalize()
 		idx.SetReady(true)
 
-		slog.Info("reindex complete", "docs", count, "stats", idx.Stats())
-		c.JSON(http.StatusAccepted, gin.H{
-			"message": "reindex complete",
-			"stats":   idx.Stats(),
-		})
+		slog.Info("reindex complete", "docs", count)
+		c.JSON(http.StatusAccepted, gin.H{"message": "reindex complete", "stats": idx.Stats()})
 	}
 }
 
-// handleIngestNotify indexes a single newly uploaded file without a full reset.
 func handleIngestNotify(idx *indexer.Index) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var req struct {
@@ -142,15 +104,10 @@ func handleIngestNotify(idx *indexer.Index) gin.HandlerFunc {
 			return
 		}
 
-		dataDir := os.Getenv("DATA_DIR")
-		if dataDir == "" {
-			dataDir = os.Getenv("UPLOAD_DIR")
-		}
-
-		filePath := filepath.Join(dataDir, filepath.Base(req.Filename))
+		filePath := filepath.Join(dataDir(), filepath.Base(req.Filename))
 		docs, err := pq.ReadParquet(filePath)
 		if err != nil {
-			slog.Error("failed to index new file", "file", req.Filename, "err", err)
+			slog.Error("failed to index file", "file", req.Filename, "err", err)
 			c.JSON(http.StatusUnprocessableEntity, gin.H{"error": err.Error()})
 			return
 		}
@@ -159,9 +116,11 @@ func handleIngestNotify(idx *indexer.Index) gin.HandlerFunc {
 			idx.AddDocument(docs[i])
 		}
 		idx.AddFile(filepath.Base(req.Filename))
+		// Finalize re-sorts and re-blocks posting lists after new documents.
+		idx.Finalize()
 		idx.InvalidateCache()
 
-		slog.Info("ingest-notify: file indexed", "file", req.Filename, "docs", len(docs))
+		slog.Info("ingest-notify indexed", "file", req.Filename, "docs", len(docs))
 		c.JSON(http.StatusOK, gin.H{
 			"message":  "file indexed",
 			"filename": filepath.Base(req.Filename),
@@ -171,7 +130,7 @@ func handleIngestNotify(idx *indexer.Index) gin.HandlerFunc {
 	}
 }
 
-// loadDir reads all parquet files from dir into the index and returns total docs added.
+// loadDir reads all parquet files from dir and returns total docs added.
 func loadDir(idx *indexer.Index, dir string) int {
 	if dir == "" {
 		return 0
@@ -196,6 +155,13 @@ func loadDir(idx *indexer.Index, dir string) int {
 		slog.Info("indexed file", "file", filepath.Base(f), "docs", len(docs))
 	}
 	return total
+}
+
+func dataDir() string {
+	if d := os.Getenv("DATA_DIR"); d != "" {
+		return d
+	}
+	return os.Getenv("UPLOAD_DIR")
 }
 
 func parsePagination(c *gin.Context) (page, pageSize int) {
